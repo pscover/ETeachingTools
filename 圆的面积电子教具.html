@@ -1,0 +1,727 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>交互式扇形分割器</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  
+  <!-- 配置Tailwind自定义颜色和字体 -->
+  <script>
+    tailwind.config = {
+      theme: {
+        extend: {
+          colors: {
+            primary: '#3B82F6',
+            orange: '#F97316',
+            green: '#10B981',
+          },
+          fontFamily: {
+            inter: ['Inter', 'system-ui', 'sans-serif'],
+          },
+        },
+      }
+    }
+  </script>
+  
+  <style type="text/tailwindcss">
+    @layer utilities {
+      .content-auto {
+        content-visibility: auto;
+      }
+      .center-container {
+        @apply flex items-center justify-center min-h-screen bg-gradient-to-br from-slate-50 to-slate-100 dark:from-slate-900 dark:to-slate-800;
+      }
+      #sectorCanvas {
+        @apply absolute top-0 left-0;
+      }
+      .control-panel {
+        @apply fixed top-4 left-1/2 transform -translate-x-1/2 bg-white/80 dark:bg-slate-800/80 p-3 rounded-lg shadow-lg z-20 flex items-center gap-3 backdrop-blur-sm;
+      }
+      .input-field {
+        @apply border border-slate-300 dark:border-slate-600 rounded-md px-2 py-1.5 w-24 focus:outline-none focus:ring-2 focus:ring-primary dark:bg-slate-700 dark:text-white text-sm;
+      }
+      .control-btn {
+        @apply bg-primary hover:bg-primary/90 text-white px-3 py-1.5 rounded-md transition-all duration-200 text-sm;
+      }
+      .expand-btn {
+        @apply bg-green hover:bg-green/90 text-white px-3 py-1.5 rounded-md transition-all duration-200 text-sm;
+      }
+      .highlight-btn {
+        @apply bg-red-500 hover:bg-red-600 text-white px-3 py-1.5 rounded-md transition-all duration-200 text-sm;
+      }
+      .error-msg {
+        @apply text-red-500 text-xs ml-1 hidden;
+      }
+      .range-hint {
+        @apply text-xs text-slate-500 dark:text-slate-400 ml-1;
+      }
+    }
+  </style>
+</head>
+<body class="font-inter text-slate-800 dark:text-slate-200 overflow-hidden">
+  <div class="center-container">
+    <canvas id="sectorCanvas"></canvas>
+    <div id="canvasError" class="absolute inset-0 flex items-center justify-center text-red-500 hidden">
+      无法加载画布，请检查浏览器设置
+    </div>
+  </div>
+  
+  <!-- 控制面板 -->
+  <div class="control-panel">
+    <label for="sectorCount" class="text-sm font-medium">分割数量:</label>
+    <input 
+      type="number" 
+      id="sectorCount" 
+      class="input-field" 
+      min="10" 
+      max="100" 
+      step="2" 
+      value="10"
+    >
+    <span class="range-hint">（10-100之间的偶数）</span>
+    <button id="splitBtn" class="control-btn">
+      应用
+    </button>
+    <button id="expandBtn" class="expand-btn">
+      展开
+    </button>
+    <button id="highlightBtn" class="highlight-btn">
+      显示弧
+    </button>
+    <span id="errorMsg" class="error-msg"></span>
+  </div>
+
+  <script>
+    // 页面加载完成后初始化
+    window.addEventListener('load', init);
+    
+    // 全局变量
+    let canvas, ctx;
+    let canvasError, sectorCountInput, splitBtn, expandBtn, highlightBtn, errorMsg;
+    let sectors = [];
+    let isDraggingGreenGroup = false;  // 绿色分组拖动状态
+    let isDraggingOrangeGroup = false; // 橙色分组拖动状态
+    let dragStart = { x: 0, y: 0 };    // 拖动起始鼠标位置
+    let greenGroupStartPos = [];       // 绿色扇形初始位置
+    let orangeGroupStartPos = [];      // 橙色扇形初始位置
+    let canvasOffset = { x: 0, y: 0 }; // Canvas偏移量
+    let centerPoint = { x: 0, y: 0 };  // 画布中心点
+    let isExpanded = false;            // 扇形是否展开
+    let isHighlighted = false;         // 扇形弧是否突出显示
+    
+    // 工具函数：将角度标准化到0~2π范围
+    function normalizeAngle(angle) {
+      angle = angle % (2 * Math.PI);
+      if (angle < 0) angle += 2 * Math.PI;
+      return angle;
+    }
+    
+    // 点对象构造函数（用于扇形定位）
+    function Point(type, sector) {
+      this.type = type;     // left, middle, right
+      this.sector = sector;
+      this.x = 0;
+      this.y = 0;
+      
+      this.updatePosition = function() {
+        if (!this.sector) return;
+        
+        const sector = this.sector;
+        let angle;
+        
+        switch(this.type) {
+          case 'left': angle = sector.startAngle; break;
+          case 'middle': angle = sector.midAngle; break;
+          case 'right': angle = sector.endAngle; break;
+          default: angle = 0;
+        }
+        
+        this.x = sector.x + Math.cos(angle) * sector.radius;
+        this.y = sector.y + Math.sin(angle) * sector.radius;
+      };
+    }
+    
+    // 扇形对象构造函数
+    function Sector(id, startAngle, endAngle, color, x, y, radius) {
+      this.startAngle = normalizeAngle(startAngle);
+      this.endAngle = normalizeAngle(endAngle);
+      this.midAngle = normalizeAngle((this.startAngle + this.endAngle) / 2);
+      this.color = color;
+      this.x = x;
+      this.y = y;
+      this.radius = radius;
+      this.isSelected = false;
+      this.highlightArc = false; // 弧是否突出显示
+      
+      // 保存原始状态（用于收起时恢复）
+      this.originalState = {
+        startAngle: this.startAngle,
+        endAngle: this.endAngle,
+        midAngle: this.midAngle,
+        x: x,
+        y: y
+      };
+      
+      // 创建特征点
+      this.leftPoint = new Point('left', this);
+      this.middlePoint = new Point('middle', this);
+      this.rightPoint = new Point('right', this);
+      
+      this.updatePoints();
+    }
+    
+    // 扇形原型方法
+    Sector.prototype = {
+      translateSector: function(dx, dy) {
+        this.x += dx;
+        this.y += dy;
+        this.updatePoints();
+      },
+      
+      updatePoints: function() {
+        this.leftPoint.updatePosition();
+        this.middlePoint.updatePosition();
+        this.rightPoint.updatePosition();
+      },
+      
+      reset: function() {
+        this.startAngle = this.originalState.startAngle;
+        this.endAngle = this.originalState.endAngle;
+        this.midAngle = this.originalState.midAngle;
+        this.x = this.originalState.x;
+        this.y = this.originalState.y;
+        this.isSelected = false;
+        this.highlightArc = false;
+        this.updatePoints();
+      },
+      
+      setSelected: function(isSelected) {
+        this.isSelected = isSelected;
+      },
+      
+      setHighlightArc: function(highlight) {
+        this.highlightArc = highlight;
+      }
+    };
+    
+    // 获取指定颜色的扇形分组
+    function getSectorGroup(color) {
+      return sectors.filter(sector => sector.color === color);
+    }
+    
+    // 初始化函数
+    function init() {
+      try {
+        canvas = document.getElementById('sectorCanvas');
+        ctx = canvas.getContext('2d');
+        canvasError = document.getElementById('canvasError');
+        sectorCountInput = document.getElementById('sectorCount');
+        splitBtn = document.getElementById('splitBtn');
+        expandBtn = document.getElementById('expandBtn');
+        highlightBtn = document.getElementById('highlightBtn');
+        errorMsg = document.getElementById('errorMsg');
+        
+        resizeCanvas();
+        window.addEventListener('resize', resizeCanvas);
+        
+        // 绑定控制事件
+        splitBtn.addEventListener('click', handleSplit);
+        sectorCountInput.addEventListener('keypress', (e) => {
+          if (e.key === 'Enter') handleSplit();
+        });
+        expandBtn.addEventListener('click', toggleAllSectors);
+        highlightBtn.addEventListener('click', toggleHighlightArcs);
+        
+        // 绑定拖动事件
+        canvas.addEventListener('mousedown', startDrag);
+        window.addEventListener('mousemove', drag);
+        window.addEventListener('mouseup', endDrag);
+        
+        // 绑定触摸事件
+        canvas.addEventListener('touchstart', startDragTouch);
+        window.addEventListener('touchmove', dragTouch);
+        window.addEventListener('touchend', endDrag);
+        
+        // 初始创建10个扇形
+        createSectors(10);
+        
+      } catch (err) {
+        console.error('初始化错误:', err);
+        canvasError.textContent = '初始化失败: ' + err.message;
+        canvasError.classList.remove('hidden');
+      }
+    }
+    
+    // 显示错误信息
+    function showError(message) {
+      errorMsg.textContent = message;
+      errorMsg.classList.remove('hidden');
+      setTimeout(() => errorMsg.classList.add('hidden'), 3000);
+    }
+    
+    // 调整Canvas尺寸，优化16:10分辨率适配
+    function resizeCanvas() {
+      // 获取窗口尺寸
+      let windowWidth = window.innerWidth;
+      let windowHeight = window.innerHeight;
+      
+      // 16:10 比例适配逻辑
+      const targetRatio = 16 / 10;
+      const currentRatio = windowWidth / windowHeight;
+      
+      // 根据当前比例调整画布尺寸，保持16:10的内容比例
+      if (currentRatio > targetRatio) {
+        // 宽度过大，以高度为基准计算合适宽度
+        canvas.width = windowHeight * targetRatio;
+        canvas.height = windowHeight;
+      } else {
+        // 高度过大，以宽度为基准计算合适高度
+        canvas.width = windowWidth;
+        canvas.height = windowWidth / targetRatio;
+      }
+      
+      // 居中显示
+      centerPoint.x = canvas.width / 2;
+      centerPoint.y = canvas.height / 2;
+      
+      // 计算Canvas元素在页面中的偏移量
+      const rect = canvas.getBoundingClientRect();
+      canvasOffset.x = rect.left;
+      canvasOffset.y = rect.top;
+      
+      // 调整扇形大小以适应16:10比例
+      if (sectors.length > 0) {
+        // 基于较短边计算半径，确保在16:10比例下显示正常
+        const radius = Math.min(canvas.width, canvas.height) * 0.35;
+        sectors.forEach(sector => {
+          sector.radius = radius;
+          sector.updatePoints();
+        });
+        drawSectors();
+      }
+    }
+    
+    // 获取扇形颜色
+    function getSectorColor(angle) {
+      return normalizeAngle(angle) < Math.PI ? '#F97316' : '#10B981';
+    }
+    
+    // 创建扇形
+    function createSectors(count) {
+      try {
+        // 验证数量范围为10-100之间的偶数
+        if (typeof count !== 'number' || isNaN(count) || count < 10 || count > 100 || count % 2 !== 0) {
+          throw new Error('请输入10-100之间的偶数');
+        }
+        
+        sectors = [];
+        isExpanded = false;
+        isHighlighted = false;
+        expandBtn.textContent = '展开';
+        highlightBtn.textContent = '显示弧';
+        
+        // 基于16:10比例计算合适的半径
+        const radius = Math.min(canvas.width, canvas.height) * 0.35;
+        const totalAngle = 2 * Math.PI;
+        const angleStep = totalAngle / count;
+        
+        for (let i = 0; i < count; i++) {
+          const startAngle = i * angleStep;
+          const endAngle = startAngle + angleStep;
+          const midAngle = (startAngle + endAngle) / 2;
+          const color = getSectorColor(midAngle);
+          
+          const sector = new Sector(
+            i,
+            startAngle,
+            endAngle,
+            color,
+            centerPoint.x,
+            centerPoint.y,
+            radius
+          );
+          
+          sectors.push(sector);
+        }
+        
+        drawSectors();
+        return true;
+        
+      } catch (err) {
+        showError(err.message);
+        return false;
+      }
+    }
+    
+    // 处理分割按钮点击
+    function handleSplit() {
+      const count = parseInt(sectorCountInput.value, 10);
+      createSectors(count);
+    }
+    
+    // 展开/收起所有扇形
+    function toggleAllSectors() {
+      const greenSectors = getSectorGroup('#10B981');
+      const orangeSectors = getSectorGroup('#F97316');
+      
+      if (greenSectors.length === 0 || orangeSectors.length === 0) {
+        showError('扇形数据不完整');
+        return;
+      }
+      
+      if (!isExpanded) {
+        // 展开绿色和橙色扇形
+        expandGreenSectors(greenSectors);
+        expandOrangeSectors(orangeSectors);
+        isExpanded = true;
+        expandBtn.textContent = '收起';
+      } else {
+        // 收起所有扇形
+        greenSectors.forEach(sector => sector.reset());
+        orangeSectors.forEach(sector => sector.reset());
+        isExpanded = false;
+        expandBtn.textContent = '展开';
+      }
+      
+      drawSectors();
+    }
+    
+    // 切换所有扇形弧的突出显示状态
+    function toggleHighlightArcs() {
+      isHighlighted = !isHighlighted;
+      sectors.forEach(sector => {
+        sector.setHighlightArc(isHighlighted);
+      });
+      highlightBtn.textContent = isHighlighted ? '隐藏弧' : '显示弧';
+      drawSectors();
+    }
+    
+    // 展开绿色扇形 - 旋转90°，右侧排列
+    function expandGreenSectors(greenSectors) {
+      // 按顺时针排序
+      const sortedGreenSectors = [...greenSectors].sort((a, b) => a.midAngle - b.midAngle);
+      
+      // 计算90°的精确弧度值（π/2）
+      const targetAngleRad = normalizeAngle(Math.PI / 2);
+      
+      // 计算单个扇形的角度宽度
+      const sectorAngleWidth = sortedGreenSectors[0].endAngle - sortedGreenSectors[0].startAngle;
+      
+      // 为每个扇形设置旋转后的角度
+      sortedGreenSectors.forEach((sector) => {
+        sector.midAngle = targetAngleRad;
+        sector.startAngle = normalizeAngle(targetAngleRad - sectorAngleWidth / 2);
+        sector.endAngle = normalizeAngle(targetAngleRad + sectorAngleWidth / 2);
+        sector.updatePoints();
+      });
+      
+      // 定位第一个扇形（右侧）
+      const firstSector = sortedGreenSectors[0];
+      const screenPadding = 20;
+      // 根据16:10比例调整位置
+      const targetX = canvas.width - screenPadding - firstSector.radius * 0.3 - 200;
+      const targetY = centerPoint.y;
+      
+      // 移动第一个扇形
+      const dx = targetX - firstSector.x;
+      const dy = targetY - firstSector.y;
+      firstSector.translateSector(dx, dy);
+      
+      // 依次排列后续扇形（右到左）
+      for (let i = 1; i < sortedGreenSectors.length; i++) {
+        const current = sortedGreenSectors[i];
+        const prev = sortedGreenSectors[i - 1];
+        
+        // 当前扇形右边缘对齐前一个扇形左边缘
+        const dx = prev.leftPoint.x - current.rightPoint.x;
+        const dy = prev.leftPoint.y - current.rightPoint.y;
+        
+        current.translateSector(dx, dy);
+      }
+    }
+    
+    // 展开橙色扇形 - 旋转90°，右侧排列
+    function expandOrangeSectors(orangeSectors) {
+      // 按逆时针排序
+      const sortedOrangeSectors = [...orangeSectors].sort((a, b) => b.midAngle - a.midAngle);
+      
+      // 计算90°的精确弧度值
+      const targetAngleRad = normalizeAngle(Math.PI / 2);
+      
+      // 计算单个扇形的角度宽度
+      const sectorAngleWidth = sortedOrangeSectors[0].endAngle - sortedOrangeSectors[0].startAngle;
+      
+      // 为每个扇形设置旋转后的角度
+      sortedOrangeSectors.forEach((sector) => {
+        sector.midAngle = targetAngleRad;
+        sector.startAngle = normalizeAngle(targetAngleRad - sectorAngleWidth / 2);
+        sector.endAngle = normalizeAngle(targetAngleRad + sectorAngleWidth / 2);
+        sector.updatePoints();
+      });
+      
+      // 定位第一个橙色扇形（右侧）
+      const firstSector = sortedOrangeSectors[0];
+      const screenPadding = 20;
+      // 根据16:10比例调整位置
+      const targetX = canvas.width - screenPadding - firstSector.radius * 0.3;
+      const targetY = centerPoint.y;
+      
+      // 移动橙1到右侧目标位置
+      const dx = targetX - firstSector.x;
+      const dy = targetY - firstSector.y;
+      firstSector.translateSector(dx, dy);
+      
+      // 依次排列后续扇形：橙n左控制点对齐橙n-1右控制点
+      for (let i = 1; i < sortedOrangeSectors.length; i++) {
+        const current = sortedOrangeSectors[i];
+        const prev = sortedOrangeSectors[i - 1];
+        
+        // 关键逻辑：当前扇形左控制点对齐前一个扇形右控制点
+        const dx = prev.rightPoint.x - current.leftPoint.x;
+        const dy = prev.rightPoint.y - current.leftPoint.y;
+        
+        current.translateSector(dx, dy);
+      }
+    }
+    
+    // 绘制扇形
+    function drawSectors() {
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      
+      sectors.forEach(sector => {
+        ctx.save();
+        // 绘制扇形
+        ctx.beginPath();
+        ctx.moveTo(sector.x, sector.y);
+        ctx.arc(
+          sector.x, 
+          sector.y, 
+          sector.radius, 
+          sector.startAngle, 
+          sector.endAngle
+        );
+        ctx.closePath();
+        
+        // 选中状态样式
+        if (sector.isSelected) {
+          ctx.fillStyle = adjustColor(sector.color, 20);
+        } else {
+          ctx.fillStyle = sector.color;
+        }
+        ctx.fill();
+        
+        // 绘制扇形边缘线 - 设置为最细的1px
+        ctx.strokeStyle = '#fff';
+        ctx.lineWidth = sector.isSelected ? 2 : 1; // 未选中时1px，选中时稍微粗一点为2px以便区分
+        ctx.stroke();
+        
+        // 如果需要突出显示弧，则绘制红色弧线
+        if (sector.highlightArc) {
+          ctx.beginPath();
+          // 稍微扩大一点半径，让红色弧线更明显
+          ctx.arc(
+            sector.x, 
+            sector.y, 
+            sector.radius * 1.02, 
+            sector.startAngle, 
+            sector.endAngle
+          );
+          ctx.strokeStyle = '#EF4444'; // 红色
+          ctx.lineWidth = 2; // 红色弧线保持2px以确保可见性
+          ctx.stroke();
+        }
+        
+        ctx.restore();
+      });
+    }
+    
+    // 调整颜色亮度
+    function adjustColor(color, percent) {
+      const colors = {
+        '#F97316': { darker: '#EA580C', lighter: '#FB923C' },
+        '#10B981': { darker: '#059669', lighter: '#34D399' }
+      };
+      return percent < 0 ? colors[color].darker : colors[color].lighter;
+    }
+    
+    // 检查点是否在扇形内
+    function isPointInSector(x, y, sector) {
+      const dx = x - sector.x;
+      const dy = y - sector.y;
+      const distance = Math.sqrt(dx * dx + dy * dy);
+      
+      if (distance > sector.radius) return false;
+      
+      let pointAngle = normalizeAngle(Math.atan2(dy, dx));
+      const start = sector.startAngle;
+      const end = sector.endAngle;
+      
+      if (start <= end) {
+        return pointAngle >= start && pointAngle <= end;
+      } else {
+        return pointAngle >= start || pointAngle <= end;
+      }
+    }
+    
+    // 拖动开始
+    function startDrag(e) {
+      if (!isExpanded) return;
+      
+      const x = e.clientX - canvasOffset.x;
+      const y = e.clientY - canvasOffset.y;
+      
+      const greenGroup = getSectorGroup('#10B981');
+      const orangeGroup = getSectorGroup('#F97316');
+      
+      // 检查是否点击了绿色扇形
+      for (let i = 0; i < greenGroup.length; i++) {
+        const sector = greenGroup[i];
+        if (isPointInSector(x, y, sector)) {
+          isDraggingGreenGroup = true;
+          greenGroupStartPos = greenGroup.map(s => ({x: s.x, y: s.y}));
+          dragStart.x = x;
+          dragStart.y = y;
+          sectors.forEach(s => s.setSelected(s.color === '#10B981'));
+          drawSectors();
+          return;
+        }
+      }
+      
+      // 检查是否点击了橙色扇形
+      for (let i = 0; i < orangeGroup.length; i++) {
+        const sector = orangeGroup[i];
+        if (isPointInSector(x, y, sector)) {
+          isDraggingOrangeGroup = true;
+          orangeGroupStartPos = orangeGroup.map(s => ({x: s.x, y: s.y}));
+          dragStart.x = x;
+          dragStart.y = y;
+          sectors.forEach(s => s.setSelected(s.color === '#F97316'));
+          drawSectors();
+          return;
+        }
+      }
+    }
+    
+    // 拖动中
+    function drag(e) {
+      if (!isExpanded) return;
+      
+      const x = e.clientX - canvasOffset.x;
+      const y = e.clientY - canvasOffset.y;
+      const dx = x - dragStart.x;
+      const dy = y - dragStart.y;
+      
+      // 拖动绿色分组
+      if (isDraggingGreenGroup) {
+        const greenGroup = getSectorGroup('#10B981');
+        if (greenGroup.length === 0 || greenGroup.length !== greenGroupStartPos.length) return;
+        
+        greenGroup.forEach((sector, index) => {
+          sector.x = greenGroupStartPos[index].x + dx;
+          sector.y = greenGroupStartPos[index].y + dy;
+          sector.updatePoints();
+        });
+      }
+      // 拖动橙色分组
+      else if (isDraggingOrangeGroup) {
+        const orangeGroup = getSectorGroup('#F97316');
+        if (orangeGroup.length === 0 || orangeGroup.length !== orangeGroupStartPos.length) return;
+        
+        orangeGroup.forEach((sector, index) => {
+          sector.x = orangeGroupStartPos[index].x + dx;
+          sector.y = orangeGroupStartPos[index].y + dy;
+          sector.updatePoints();
+        });
+      }
+      
+      if (isDraggingGreenGroup || isDraggingOrangeGroup) {
+        drawSectors();
+      }
+    }
+    
+    // 结束拖动
+    function endDrag() {
+      isDraggingGreenGroup = false;
+      isDraggingOrangeGroup = false;
+      sectors.forEach(s => s.setSelected(false));
+      drawSectors();
+    }
+    
+    // 触摸事件：开始拖动
+    function startDragTouch(e) {
+      if (!isExpanded) return;
+      
+      e.preventDefault();
+      if (!e.touches || e.touches.length === 0) return;
+      
+      const touch = e.touches[0];
+      const x = touch.clientX - canvasOffset.x;
+      const y = touch.clientY - canvasOffset.y;
+      
+      const greenGroup = getSectorGroup('#10B981');
+      const orangeGroup = getSectorGroup('#F97316');
+      
+      // 检查绿色扇形
+      for (let i = 0; i < greenGroup.length; i++) {
+        const sector = greenGroup[i];
+        if (isPointInSector(x, y, sector)) {
+          isDraggingGreenGroup = true;
+          greenGroupStartPos = greenGroup.map(s => ({x: s.x, y: s.y}));
+          dragStart.x = x;
+          dragStart.y = y;
+          sectors.forEach(s => s.setSelected(s.color === '#10B981'));
+          drawSectors();
+          return;
+        }
+      }
+      
+      // 检查橙色扇形
+      for (let i = 0; i < orangeGroup.length; i++) {
+        const sector = orangeGroup[i];
+        if (isPointInSector(x, y, sector)) {
+          isDraggingOrangeGroup = true;
+          orangeGroupStartPos = orangeGroup.map(s => ({x: s.x, y: s.y}));
+          dragStart.x = x;
+          dragStart.y = y;
+          sectors.forEach(s => s.setSelected(s.color === '#F97316'));
+          drawSectors();
+          return;
+        }
+      }
+    }
+    
+    // 触摸事件：拖动中
+    function dragTouch(e) {
+      if (!isExpanded || (!isDraggingGreenGroup && !isDraggingOrangeGroup)) return;
+      
+      e.preventDefault();
+      if (!e.touches || e.touches.length === 0) return;
+      
+      const touch = e.touches[0];
+      const x = touch.clientX - canvasOffset.x;
+      const y = touch.clientY - canvasOffset.y;
+      const dx = x - dragStart.x;
+      const dy = y - dragStart.y;
+      
+      if (isDraggingGreenGroup) {
+        const greenGroup = getSectorGroup('#10B981');
+        greenGroup.forEach((sector, index) => {
+          sector.x = greenGroupStartPos[index].x + dx;
+          sector.y = greenGroupStartPos[index].y + dy;
+          sector.updatePoints();
+        });
+      } else if (isDraggingOrangeGroup) {
+        const orangeGroup = getSectorGroup('#F97316');
+        orangeGroup.forEach((sector, index) => {
+          sector.x = orangeGroupStartPos[index].x + dx;
+          sector.y = orangeGroupStartPos[index].y + dy;
+          sector.updatePoints();
+        });
+      }
+      
+      drawSectors();
+    }
+  </script>
+</body>
+</html>
